@@ -9,22 +9,43 @@ import numpy as np
 
 CARD_WIDTH = 200
 CARD_HEIGHT = 300
-RANK_ROI = (8, 8, 64, 84)
-SUIT_ROI = (8, 92, 64, 152)
+CORNER_ROI = (0, 0, 50, 160)
 
 
 """
-Rendezi a négyszög sarkait bal felső, jobb felső, jobb alsó, bal alsó sorrendbe
+Rendezi a négyszög sarkait: bal felső, jobb felső, jobb alsó, bal alsó.
+Kezeli a forgatott kártyákat és biztosítja a portré tájolást!
 """
 def order_points(points: np.ndarray) -> np.ndarray:
-    pts = points.astype(np.float32)
-    pts = pts[np.argsort(pts[:, 1])]
-    top = pts[:2]
-    bottom = pts[2:]
-    top = top[np.argsort(top[:, 0])]
-    tl, tr = top
-    bottom = bottom[np.argsort(bottom[:, 0])]
-    bl, br = bottom
+    center = np.mean(points, axis=0)
+    angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+    pts = points[np.argsort(angles)]
+    
+    dists = [np.linalg.norm(pts[i] - pts[(i+1)%4]) for i in range(4)]
+    
+    if dists[0] + dists[2] < dists[1] + dists[3]:
+        short_edges = [(0, 1), (2, 3)]
+    else:
+        short_edges = [(1, 2), (3, 0)]
+        
+    avg_y1 = (pts[short_edges[0][0]][1] + pts[short_edges[0][1]][1]) / 2.0
+    avg_y2 = (pts[short_edges[1][0]][1] + pts[short_edges[1][1]][1]) / 2.0
+    
+    top_edge = short_edges[0] if avg_y1 < avg_y2 else short_edges[1]
+    
+    p1, p2 = pts[top_edge[0]], pts[top_edge[1]]
+    if p1[0] < p2[0]:
+        tl, tr = p1, p2
+    else:
+        tl, tr = p2, p1
+        
+    bottom_idx = [i for i in range(4) if i not in top_edge]
+    p3, p4 = pts[bottom_idx[0]], pts[bottom_idx[1]]
+    if p3[0] < p4[0]:
+        bl, br = p3, p4
+    else:
+        bl, br = p4, p3
+        
     return np.array([tl, tr, br, bl], dtype=np.float32)
 
 
@@ -32,27 +53,63 @@ def order_points(points: np.ndarray) -> np.ndarray:
 Megkeresi a kártyalap kontúrját a képen, visszaadja a sarkok koordinátáit
 """
 def find_card_quad(image_gray: np.ndarray) -> np.ndarray:
-    blurred = cv2.GaussianBlur(image_gray, (5, 5), 0)
     h, w = image_gray.shape[:2]
-    min_area = max(4000, int(h * w * 0.01))
-
+    scale = 800.0 / w
+    if scale < 1.0:
+        gray_scaled = cv2.resize(image_gray, (0, 0), fx=scale, fy=scale)
+    else:
+        gray_scaled = image_gray
+        scale = 1.0
+        
+    blurred = cv2.GaussianBlur(gray_scaled, (5, 5), 0)
+    
     edges = cv2.Canny(blurred, 50, 150)
     edges = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=1)
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         raise RuntimeError("Nem talált kártya-kontúrt")
-    contour = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(contour)
-    if area < min_area:
-        raise RuntimeError("Nem talált elég nagy kártya-kontúrt")
-    x, y, bw, bh = cv2.boundingRect(contour)
-    quad = np.array([
-        [x, y],
-        [x + bw, y],
-        [x + bw, y + bh],
-        [x, y + bh]
-    ], dtype=np.float32)
+        
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    min_area = int(gray_scaled.shape[0] * gray_scaled.shape[1] * 0.05) 
+    
+    quad = None
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            break
+            
+        peri = cv2.arcLength(contour, True)
+        for eps in np.linspace(0.01, 0.1, 15):
+            approx = cv2.approxPolyDP(contour, eps * peri, True)
+            if len(approx) == 4:
+                quad = approx.reshape(4, 2).astype(np.float32)
+                break
+        if quad is not None:
+            break
+            
+    if quad is None:
+        edges_fallback = cv2.Canny(blurred, 15, 50)
+        edges_fallback = cv2.dilate(edges_fallback, np.ones((3, 3), dtype=np.uint8), iterations=1)
+        fallback_contours, _ = cv2.findContours(edges_fallback, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        valid_pts = []
+        for c in fallback_contours:
+            if cv2.contourArea(c) > 50:
+                valid_pts.append(c)
+                
+        if not valid_pts:
+            raise RuntimeError("Nem találtunk sem élt, sem belső objektumokat a kártyán!")
+            
+        all_pts = np.vstack(valid_pts)
+        rect = cv2.minAreaRect(all_pts)
+        
+        center, size, angle = rect
+        rect = (center, (size[0]*1.15, size[1]*1.15), angle)
+        
+        quad = cv2.boxPoints(rect).astype(np.float32)
+        
+    quad = quad / scale
     return order_points(quad)
 
 
@@ -76,6 +133,53 @@ def preprocess_symbol(symbol_img: np.ndarray) -> np.ndarray:
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     return binary
+
+
+"""
+Megkeresi és kivágja a rang és a szín kontúrjait a sarokrégióból
+"""
+def extract_dynamic_symbols(warped_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    x, y, w, h = CORNER_ROI
+    corner_bgr = warped_bgr[y:y+h, x:x+w]
+    corner_binary = preprocess_symbol(corner_bgr)
+    
+    c_pre, _ = cv2.findContours(corner_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in c_pre:
+        bx, by, bw, bh = cv2.boundingRect(c)
+        if bh > 100 or bw > 45:
+            cv2.drawContours(corner_binary, [c], -1, 0, -1)
+    
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+    merged = cv2.morphologyEx(corner_binary, cv2.MORPH_CLOSE, kernel_close)
+    
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    valid_boxes = []
+    for c in contours:
+        bx, by, bw, bh = cv2.boundingRect(c)
+        if bw >= 5 and bh >= 10:
+            valid_boxes.append((bx, by, bw, bh))
+            
+    if len(valid_boxes) < 2:
+        raise RuntimeError(f"Nem találtam megfelelő szimbólumokat a sarokban (talált: {len(valid_boxes)})")
+        
+    valid_boxes.sort(key=lambda b: b[1])
+    
+    rx, ry, rw, rh = valid_boxes[0]
+    sx, sy, sw, sh = valid_boxes[1]
+    
+    pad = 4
+    def crop_padded(bx, by, bw, bh):
+        y1 = max(0, by - pad)
+        y2 = min(corner_binary.shape[0], by + bh + pad)
+        x1 = max(0, bx - pad)
+        x2 = min(corner_binary.shape[1], bx + bw + pad)
+        return corner_binary[y1:y2, x1:x2]
+        
+    rank_query = crop_padded(rx, ry, rw, rh)
+    suit_query = crop_padded(sx, sy, sw, sh)
+    
+    return rank_query, suit_query
 
 
 """
@@ -126,11 +230,7 @@ def recognize_single_card(
     quad = find_card_quad(image_gray)
     warped = warp_card(image_bgr, quad)
 
-    rx1, ry1, rx2, ry2 = RANK_ROI
-    sx1, sy1, sx2, sy2 = SUIT_ROI
-
-    rank_query = preprocess_symbol(warped[ry1:ry2, rx1:rx2])
-    suit_query = preprocess_symbol(warped[sy1:sy2, sx1:sx2])
+    rank_query, suit_query = extract_dynamic_symbols(warped)
 
     rank_templates = load_templates(rank_templates_dir)
     suit_templates = load_templates(suit_templates_dir)
