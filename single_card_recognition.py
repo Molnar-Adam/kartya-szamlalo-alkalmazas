@@ -10,6 +10,13 @@ import numpy as np
 CARD_WIDTH = 200
 CARD_HEIGHT = 300
 CORNER_ROI = (0, 0, 50, 160)
+MATCH_CANVAS = 64
+MATCH_PADDING = 6
+TM_METHOD_WEIGHTS = (
+    (cv2.TM_CCOEFF_NORMED, 0.45),
+    (cv2.TM_CCORR_NORMED, 0.35),
+    (cv2.TM_SQDIFF_NORMED, 0.20),
+)
 
 
 """
@@ -135,6 +142,78 @@ def preprocess_symbol(symbol_img: np.ndarray) -> np.ndarray:
     return binary
 
 
+
+def normalize_binary_symbol(symbol_img: np.ndarray) -> np.ndarray:
+    if symbol_img.ndim == 3:
+        gray = cv2.cvtColor(symbol_img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = symbol_img.copy()
+
+    if gray.dtype != np.uint8:
+        gray = gray.astype(np.uint8)
+
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Egységes polaritás: a szimbólum legyen fehér fekete háttéren.
+    if np.mean(binary) > 127:
+        binary = cv2.bitwise_not(binary)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.zeros((MATCH_CANVAS, MATCH_CANVAS), dtype=np.uint8)
+
+    contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(contour)
+    if w <= 0 or h <= 0:
+        return np.zeros((MATCH_CANVAS, MATCH_CANVAS), dtype=np.uint8)
+
+    cropped = binary[y:y + h, x:x + w]
+
+    max_side = max(w, h)
+    scale = (MATCH_CANVAS - 2 * MATCH_PADDING) / max(max_side, 1)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(cropped, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((MATCH_CANVAS, MATCH_CANVAS), dtype=np.uint8)
+    off_x = (MATCH_CANVAS - new_w) // 2
+    off_y = (MATCH_CANVAS - new_h) // 2
+    canvas[off_y:off_y + new_h, off_x:off_x + new_w] = resized
+    return canvas
+
+
+def iou_score(a: np.ndarray, b: np.ndarray) -> float:
+    a_mask = a > 0
+    b_mask = b > 0
+    union = np.logical_or(a_mask, b_mask).sum()
+    if union == 0:
+        return 0.0
+    inter = np.logical_and(a_mask, b_mask).sum()
+    return float(inter / union)
+
+
+def contour_shape_score(a: np.ndarray, b: np.ndarray) -> float:
+    ca, _ = cv2.findContours(a, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cb, _ = cv2.findContours(b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not ca or not cb:
+        return 0.0
+    c1 = max(ca, key=cv2.contourArea)
+    c2 = max(cb, key=cv2.contourArea)
+    dist = cv2.matchShapes(c1, c2, cv2.CONTOURS_MATCH_I1, 0.0)
+    return float(1.0 / (1.0 + dist))
+
+
+def template_ensemble_score(query: np.ndarray, template: np.ndarray) -> float:
+    score = 0.0
+    for method, weight in TM_METHOD_WEIGHTS:
+        raw = float(cv2.matchTemplate(query, template, method)[0, 0])
+        # SQDIFF esetben a kisebb érték jobb, ezért invertáljuk.
+        method_score = 1.0 - raw if method == cv2.TM_SQDIFF_NORMED else raw
+        score += weight * method_score
+    return float(score)
+
+
 """
 Megkeresi és kivágja a rang és a szín kontúrjait a sarokrégióból
 """
@@ -193,19 +272,26 @@ def load_templates(directory: Path) -> Dict[str, np.ndarray]:
         img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
-        templates[path.stem] = img
+        templates[path.stem] = normalize_binary_symbol(img)
     return templates
 
 
 """
 Megkeresi hogy a lekérdezett szimbólum melyik sablonhoz hasonlít legjobban
 """
-def best_template_match(query: np.ndarray, templates: Dict[str, np.ndarray]) -> Tuple[str, float]:
+def best_template_match(
+    query: np.ndarray,
+    templates: Dict[str, np.ndarray],
+) -> Tuple[str, float]:
+    query_norm = normalize_binary_symbol(query)
     best_name = "ismeretlen"
     best_score = -1.0
     for name, tpl in templates.items():
-        resized = cv2.resize(query, (tpl.shape[1], tpl.shape[0]), interpolation=cv2.INTER_AREA)
-        score = cv2.matchTemplate(resized, tpl, cv2.TM_CCOEFF_NORMED)[0, 0]
+        tm_score = template_ensemble_score(query_norm, tpl)
+        overlap = iou_score(query_norm, tpl)
+        shape = contour_shape_score(query_norm, tpl)
+
+        score = 0.55 * tm_score + 0.30 * overlap + 0.15 * shape
         if score > best_score:
             best_score = float(score)
             best_name = name
