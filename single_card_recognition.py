@@ -9,7 +9,7 @@ import numpy as np
 
 CARD_WIDTH = 200
 CARD_HEIGHT = 300
-CORNER_ROI = (0, 0, 50, 160)
+CORNER_ROI = (0, 0, 35, 160)
 MATCH_CANVAS = 64
 MATCH_PADDING = 6
 TM_METHOD_WEIGHTS = (
@@ -106,7 +106,7 @@ def find_card_quad(image_gray: np.ndarray) -> np.ndarray:
                 valid_pts.append(c)
                 
         if not valid_pts:
-            raise RuntimeError("Nem találtunk sem élt, sem belső objektumokat a kártyán!")
+            raise RuntimeError("Nem talált sem élt, sem belső objektumokat a kártyán!")
             
         all_pts = np.vstack(valid_pts)
         rect = cv2.minAreaRect(all_pts)
@@ -155,7 +155,6 @@ def normalize_binary_symbol(symbol_img: np.ndarray) -> np.ndarray:
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Egységes polaritás: a szimbólum legyen fehér fekete háttéren.
     if np.mean(binary) > 127:
         binary = cv2.bitwise_not(binary)
 
@@ -163,8 +162,20 @@ def normalize_binary_symbol(symbol_img: np.ndarray) -> np.ndarray:
     if not contours:
         return np.zeros((MATCH_CANVAS, MATCH_CANVAS), dtype=np.uint8)
 
-    contour = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(contour)
+    x_min, y_min = binary.shape[1], binary.shape[0]
+    x_max, y_max = 0, 0
+    for c in contours:
+        cx, cy, cw, ch = cv2.boundingRect(c)
+        if cw * ch > 10:  # Ignore very small noise
+            x_min = min(x_min, cx)
+            y_min = min(y_min, cy)
+            x_max = max(x_max, cx + cw)
+            y_max = max(y_max, cy + ch)
+
+    if x_max <= x_min or y_max <= y_min:
+        return np.zeros((MATCH_CANVAS, MATCH_CANVAS), dtype=np.uint8)
+
+    x, y, w, h = x_min, y_min, x_max - x_min, y_max - y_min
     if w <= 0 or h <= 0:
         return np.zeros((MATCH_CANVAS, MATCH_CANVAS), dtype=np.uint8)
 
@@ -208,7 +219,6 @@ def template_ensemble_score(query: np.ndarray, template: np.ndarray) -> float:
     score = 0.0
     for method, weight in TM_METHOD_WEIGHTS:
         raw = float(cv2.matchTemplate(query, template, method)[0, 0])
-        # SQDIFF esetben a kisebb érték jobb, ezért invertáljuk.
         method_score = 1.0 - raw if method == cv2.TM_SQDIFF_NORMED else raw
         score += weight * method_score
     return float(score)
@@ -218,34 +228,76 @@ def template_ensemble_score(query: np.ndarray, template: np.ndarray) -> float:
 Megkeresi és kivágja a rang és a szín kontúrjait a sarokrégióból
 """
 def extract_dynamic_symbols(warped_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    x, y, w, h = CORNER_ROI
-    corner_bgr = warped_bgr[y:y+h, x:x+w]
-    corner_binary = preprocess_symbol(corner_bgr)
-    
-    c_pre, _ = cv2.findContours(corner_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for c in c_pre:
-        bx, by, bw, bh = cv2.boundingRect(c)
-        if bh > 100 or bw > 45:
-            cv2.drawContours(corner_binary, [c], -1, 0, -1)
-    
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-    merged = cv2.morphologyEx(corner_binary, cv2.MORPH_CLOSE, kernel_close)
-    
-    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    valid_boxes = []
-    for c in contours:
-        bx, by, bw, bh = cv2.boundingRect(c)
-        if bw >= 5 and bh >= 10:
-            valid_boxes.append((bx, by, bw, bh))
-            
-    if len(valid_boxes) < 2:
-        raise RuntimeError(f"Nem találtam megfelelő szimbólumokat a sarokban (talált: {len(valid_boxes)})")
+    def _try_extract(x, y, w, h):
+        corner_bgr = warped_bgr[y:y+h, x:x+w]
+        corner_binary = preprocess_symbol(corner_bgr)
         
-    valid_boxes.sort(key=lambda b: b[1])
+        c_pre, _ = cv2.findContours(corner_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in c_pre:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            # Erase contours that are too large, or too far to the right (artifacts from the center pips)
+            if bh > 100 or bw > 45 or bx > 28:
+                cv2.drawContours(corner_binary, [c], -1, 0, -1)
+        
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+        merged = cv2.morphologyEx(corner_binary, cv2.MORPH_CLOSE, kernel_close)
+        
+        contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        valid_boxes = []
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw >= 5 and bh >= 10:
+                valid_boxes.append((bx, by, bw, bh, c))
+                
+        if len(valid_boxes) < 2:
+            return None, None
+            
+        valid_boxes.sort(key=lambda b: b[1])
+        return valid_boxes, corner_binary
+
+    valid_boxes, corner_binary = _try_extract(*CORNER_ROI)
     
-    rx, ry, rw, rh = valid_boxes[0]
-    sx, sy, sw, sh = valid_boxes[1]
+    if valid_boxes is None:
+        # Try bottom right corner (rotate ROI mathematically by sampling bottom right)
+        # Note: If the card is rotated 180 degrees, the bottom right is the new top left geometry
+        hx, hy, hw, hh = CORNER_ROI
+        bw_w = warped_bgr.shape[1]
+        bw_h = warped_bgr.shape[0]
+        # Coordinates for bottom right corner:
+        br_x = bw_w - hw - hx
+        br_y = bw_h - hh - hy
+        corner_bgr_br = warped_bgr[br_y:br_y+hh, br_x:br_x+hw]
+        # Rotáljuk 180 fokkal, hogy úgy nézzen ki, mint a bal felső
+        corner_bgr_br = cv2.rotate(corner_bgr_br, cv2.ROTATE_180)
+        
+        # Cseréljük ki átmenetileg a global ROI slice-ot és hívjuk vissza
+        # (vagy csak hívjuk preprocess symbol-t erre)
+        corner_binary = preprocess_symbol(corner_bgr_br)
+        
+        c_pre, _ = cv2.findContours(corner_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in c_pre:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bh > 100 or bw > 45 or bx > 28:
+                cv2.drawContours(corner_binary, [c], -1, 0, -1)
+        
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
+        merged = cv2.morphologyEx(corner_binary, cv2.MORPH_CLOSE, kernel_close)
+        
+        contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        valid_boxes = []
+        for c in contours:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            if bw >= 5 and bh >= 10:
+                valid_boxes.append((bx, by, bw, bh, c))
+                
+        if len(valid_boxes) < 2:
+            raise RuntimeError(f"Nem talált megfelelő szimbólumokat a sarokban (talált: {len(valid_boxes)})")
+        valid_boxes.sort(key=lambda b: b[1])
+
+    rx, ry, rw, rh, _ = valid_boxes[0]
+    sx, sy, sw, sh, _ = valid_boxes[1]
     
     pad = 4
     def crop_padded(bx, by, bw, bh):
@@ -307,7 +359,7 @@ def recognize_single_card(
     rank_templates_dir: Path,
     suit_templates_dir: Path,
     debug: bool = False,
-) -> None:
+) -> Tuple[str, str]:
     image_bgr = cv2.imread(str(image_path))
     if image_bgr is None:
         raise RuntimeError(f"Nem sikerűlt beolvasni a képet: {image_path}")
@@ -324,17 +376,8 @@ def recognize_single_card(
     rank_name, rank_score = best_template_match(rank_query, rank_templates)
     suit_name, suit_score = best_template_match(suit_query, suit_templates)
 
-    print(f"Felismert lap: {rank_name}_{suit_name}")
+    return rank_name, suit_name
 
-    view = image_bgr.copy()
-    quad_int = quad.astype(int)
-    cv2.polylines(view, [quad_int], True, (0, 255, 0), 2)
-    cv2.imshow("Input + Detected Card", view)
-    cv2.imshow("Warped Card", warped)
-    cv2.imshow("Rank Query", rank_query)
-    cv2.imshow("Suit Query", suit_query)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
 
 
 """
