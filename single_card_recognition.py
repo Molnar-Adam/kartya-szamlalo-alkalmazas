@@ -9,7 +9,7 @@ import numpy as np
 
 CARD_WIDTH = 200
 CARD_HEIGHT = 300
-CORNER_ROI = (0, 0, 35, 160)
+CORNER_ROI = (0, 0, 29, 150)
 MATCH_CANVAS = 64
 MATCH_PADDING = 6
 TM_METHOD_WEIGHTS = (
@@ -20,7 +20,7 @@ TM_METHOD_WEIGHTS = (
 
 
 """
-Rendezi a négyszög sarkait: bal felső, jobb felső, jobb alsó, bal alsó.
+4. Rendezi a négyszög sarkait: bal felső, jobb felső, jobb alsó, bal alsó.
 Kezeli a forgatott kártyákat és biztosítja a portré tájolást!
 """
 def order_points(points: np.ndarray) -> np.ndarray:
@@ -57,7 +57,7 @@ def order_points(points: np.ndarray) -> np.ndarray:
 
 
 """
-Megkeresi a kártyalap kontúrját a képen, visszaadja a sarkok koordinátáit
+3. Megkeresi a kártyalap kontúrját a képen, visszaadja a sarkok koordinátáit
 """
 def find_card_quad(image_gray: np.ndarray) -> np.ndarray:
     h, w = image_gray.shape[:2]
@@ -121,7 +121,7 @@ def find_card_quad(image_gray: np.ndarray) -> np.ndarray:
 
 
 """
-Perspektíva transzformációval kiegyenesíti a kártyát hogy mindig ugyanakkora legyen
+5. Perspektíva transzformációval kiegyenesíti a kártyát hogy mindig ugyanakkora legyen
 """
 def warp_card(image_bgr: np.ndarray, quad: np.ndarray) -> np.ndarray:
     target = np.array(
@@ -133,21 +133,20 @@ def warp_card(image_bgr: np.ndarray, quad: np.ndarray) -> np.ndarray:
 
 
 """
-Előkészíti a kivágott szimbólum képet (szürkeárnyalatosítás, elmosás, binarizálás)
+7. Előkészíti a kivágott szimbólum képet (szürkeárnyalatosítás, elmosás, binarizálás)
 """
 def preprocess_symbol(symbol_img: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(symbol_img, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    return binary
+    return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
 
 
 
+"""
+9. Normalizálja a szimbólum bináris képét közös méretre
+"""
 def normalize_binary_symbol(symbol_img: np.ndarray) -> np.ndarray:
-    if symbol_img.ndim == 3:
-        gray = cv2.cvtColor(symbol_img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = symbol_img.copy()
+    gray = symbol_img.copy()
 
     if gray.dtype != np.uint8:
         gray = gray.astype(np.uint8)
@@ -155,30 +154,14 @@ def normalize_binary_symbol(symbol_img: np.ndarray) -> np.ndarray:
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    if np.mean(binary) > 127:
-        binary = cv2.bitwise_not(binary)
 
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    valid_points = [c for c in contours if cv2.boundingRect(c)[2] * cv2.boundingRect(c)[3] > 10]
+    
+    if not valid_points:
         return np.zeros((MATCH_CANVAS, MATCH_CANVAS), dtype=np.uint8)
 
-    x_min, y_min = binary.shape[1], binary.shape[0]
-    x_max, y_max = 0, 0
-    for c in contours:
-        cx, cy, cw, ch = cv2.boundingRect(c)
-        if cw * ch > 10:  # Ignore very small noise
-            x_min = min(x_min, cx)
-            y_min = min(y_min, cy)
-            x_max = max(x_max, cx + cw)
-            y_max = max(y_max, cy + ch)
-
-    if x_max <= x_min or y_max <= y_min:
-        return np.zeros((MATCH_CANVAS, MATCH_CANVAS), dtype=np.uint8)
-
-    x, y, w, h = x_min, y_min, x_max - x_min, y_max - y_min
-    if w <= 0 or h <= 0:
-        return np.zeros((MATCH_CANVAS, MATCH_CANVAS), dtype=np.uint8)
-
+    x, y, w, h = cv2.boundingRect(np.vstack(valid_points))
     cropped = binary[y:y + h, x:x + w]
 
     max_side = max(w, h)
@@ -194,27 +177,9 @@ def normalize_binary_symbol(symbol_img: np.ndarray) -> np.ndarray:
     return canvas
 
 
-def iou_score(a: np.ndarray, b: np.ndarray) -> float:
-    a_mask = a > 0
-    b_mask = b > 0
-    union = np.logical_or(a_mask, b_mask).sum()
-    if union == 0:
-        return 0.0
-    inter = np.logical_and(a_mask, b_mask).sum()
-    return float(inter / union)
-
-
-def contour_shape_score(a: np.ndarray, b: np.ndarray) -> float:
-    ca, _ = cv2.findContours(a, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cb, _ = cv2.findContours(b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not ca or not cb:
-        return 0.0
-    c1 = max(ca, key=cv2.contourArea)
-    c2 = max(cb, key=cv2.contourArea)
-    dist = cv2.matchShapes(c1, c2, cv2.CONTOURS_MATCH_I1, 0.0)
-    return float(1.0 / (1.0 + dist))
-
-
+"""
+11. Több template matching metrikát súlyozva egyetlen pontszámmá egyesít.
+"""
 def template_ensemble_score(query: np.ndarray, template: np.ndarray) -> float:
     score = 0.0
     for method, weight in TM_METHOD_WEIGHTS:
@@ -225,17 +190,21 @@ def template_ensemble_score(query: np.ndarray, template: np.ndarray) -> float:
 
 
 """
-Megkeresi és kivágja a rang és a szín kontúrjait a sarokrégióból
+6. Megkeresi és kivágja a rang és a szín kontúrjait a sarokrégióból
 """
 def extract_dynamic_symbols(warped_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    def _try_extract(x, y, w, h):
-        corner_bgr = warped_bgr[y:y+h, x:x+w]
+    """
+    A kártyasarokból dinamikusan kinyeri a rang és suit szimbólumokat.
+    """
+    def _try_extract(corner_bgr):
+        """
+        Egy adott ROI képrészleten megpróbál két érvényes szimbólum kontúrt találni.
+        """
         corner_binary = preprocess_symbol(corner_bgr)
         
         c_pre, _ = cv2.findContours(corner_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in c_pre:
             bx, by, bw, bh = cv2.boundingRect(c)
-            # Erase contours that are too large, or too far to the right (artifacts from the center pips)
             if bh > 100 or bw > 45 or bx > 28:
                 cv2.drawContours(corner_binary, [c], -1, 0, -1)
         
@@ -256,51 +225,28 @@ def extract_dynamic_symbols(warped_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndar
         valid_boxes.sort(key=lambda b: b[1])
         return valid_boxes, corner_binary
 
-    valid_boxes, corner_binary = _try_extract(*CORNER_ROI)
+    x, y, w, h = CORNER_ROI
+    valid_boxes, corner_binary = _try_extract(warped_bgr[y:y+h, x:x+w])
     
     if valid_boxes is None:
-        # Try bottom right corner (rotate ROI mathematically by sampling bottom right)
-        # Note: If the card is rotated 180 degrees, the bottom right is the new top left geometry
-        hx, hy, hw, hh = CORNER_ROI
-        bw_w = warped_bgr.shape[1]
-        bw_h = warped_bgr.shape[0]
-        # Coordinates for bottom right corner:
-        br_x = bw_w - hw - hx
-        br_y = bw_h - hh - hy
-        corner_bgr_br = warped_bgr[br_y:br_y+hh, br_x:br_x+hw]
-        # Rotáljuk 180 fokkal, hogy úgy nézzen ki, mint a bal felső
+        bw_w, bw_h = warped_bgr.shape[1], warped_bgr.shape[0]
+        br_x, br_y = bw_w - w - x, bw_h - h - y
+        corner_bgr_br = warped_bgr[br_y:br_y+h, br_x:br_x+w]
         corner_bgr_br = cv2.rotate(corner_bgr_br, cv2.ROTATE_180)
         
-        # Cseréljük ki átmenetileg a global ROI slice-ot és hívjuk vissza
-        # (vagy csak hívjuk preprocess symbol-t erre)
-        corner_binary = preprocess_symbol(corner_bgr_br)
-        
-        c_pre, _ = cv2.findContours(corner_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in c_pre:
-            bx, by, bw, bh = cv2.boundingRect(c)
-            if bh > 100 or bw > 45 or bx > 28:
-                cv2.drawContours(corner_binary, [c], -1, 0, -1)
-        
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 5))
-        merged = cv2.morphologyEx(corner_binary, cv2.MORPH_CLOSE, kernel_close)
-        
-        contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        valid_boxes = []
-        for c in contours:
-            bx, by, bw, bh = cv2.boundingRect(c)
-            if bw >= 5 and bh >= 10:
-                valid_boxes.append((bx, by, bw, bh, c))
+        valid_boxes, corner_binary = _try_extract(corner_bgr_br)
                 
-        if len(valid_boxes) < 2:
-            raise RuntimeError(f"Nem talált megfelelő szimbólumokat a sarokban (talált: {len(valid_boxes)})")
-        valid_boxes.sort(key=lambda b: b[1])
+        if valid_boxes is None:
+            raise RuntimeError("Nem talált megfelelő szimbólumokat a sarokban")
 
     rx, ry, rw, rh, _ = valid_boxes[0]
     sx, sy, sw, sh, _ = valid_boxes[1]
     
     pad = 4
     def crop_padded(bx, by, bw, bh):
+        """
+        A kontúr köré biztonsági margóval vágja ki a szimbólumot.
+        """
         y1 = max(0, by - pad)
         y2 = min(corner_binary.shape[0], by + bh + pad)
         x1 = max(0, bx - pad)
@@ -314,7 +260,7 @@ def extract_dynamic_symbols(warped_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndar
 
 
 """
-Betölti a sablonképeket (rangok, színek)
+8. Betölti a sablonképeket (rangok, színek)
 """
 def load_templates(directory: Path) -> Dict[str, np.ndarray]:
     templates: Dict[str, np.ndarray] = {}
@@ -329,29 +275,23 @@ def load_templates(directory: Path) -> Dict[str, np.ndarray]:
 
 
 """
-Megkeresi hogy a lekérdezett szimbólum melyik sablonhoz hasonlít legjobban
+10. Megkeresi hogy a lekérdezett szimbólum melyik sablonhoz hasonlít legjobban
 """
 def best_template_match(
     query: np.ndarray,
     templates: Dict[str, np.ndarray],
 ) -> Tuple[str, float]:
     query_norm = normalize_binary_symbol(query)
-    best_name = "ismeretlen"
-    best_score = -1.0
-    for name, tpl in templates.items():
-        tm_score = template_ensemble_score(query_norm, tpl)
-        overlap = iou_score(query_norm, tpl)
-        shape = contour_shape_score(query_norm, tpl)
+    
+    def calculate_score(tpl):
+        return template_ensemble_score(query_norm, tpl)
 
-        score = 0.55 * tm_score + 0.30 * overlap + 0.15 * shape
-        if score > best_score:
-            best_score = float(score)
-            best_name = name
-    return best_name, best_score
+    best_name, best_tpl = max(templates.items(), key=lambda item: calculate_score(item[1]), default=("ismeretlen", None))
+    return best_name, calculate_score(best_tpl) if best_tpl is not None else -1.0
 
 
 """
-Betölti a képet, megtalálja a kártyát, kivágja a szimbólumokat,
+2. Betölti a képet, megtalálja a kártyát, kivágja a szimbólumokat,
 összehasonlítja a sablonokkal, kiírja és megjeleníti az eredményt
 """
 def recognize_single_card(
@@ -376,26 +316,56 @@ def recognize_single_card(
     rank_name, rank_score = best_template_match(rank_query, rank_templates)
     suit_name, suit_score = best_template_match(suit_query, suit_templates)
 
+    """
+    matplotlib segítségével vizuális megjelenítés a kapott eredményről
+    (Egy kártya ellenőrzése esetén érdemes használni)
+    """
+    if debug:
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, 3, figsize=(12, 8))
+        
+        axes[0].imshow(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+        axes[0].set_title("Eredeti kép")
+        axes[0].axis("off")
+
+        
+        axes[1].imshow(rank_query, cmap="gray")
+        axes[1].set_title(f"Rang (talált: {rank_name})")
+        axes[1].axis("off")
+        
+        axes[2].imshow(suit_query, cmap="gray")
+        axes[2].set_title(f"Szín (talált: {suit_name})")
+        axes[2].axis("off")
+        
+        
+        plt.tight_layout()
+        plt.show()
+
     return rank_name, suit_name
 
 
 
 """
-Parancssori argumentumok feldolgozása
+1. Parancssori argumentumok feldolgozása
 """
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", required=True, type=Path)
     parser.add_argument("--rank-templates", default=Path("templates/rank"), type=Path)
-    parser.add_argument("--suit-templates", default=Path("templates/suit"), type=Path)
+    parser.add_argument("--suit-templates", default=Path("templates/suit"), type=Path)   
+    parser.add_argument("--debug", action="store_true")    
     return parser.parse_args()
 
+"""
+Belépési pont: argumentumokat olvas, majd elindítja az egyképes felismerést.
+"""
 def main() -> None:
     args = parse_args()
     recognize_single_card(
         image_path=args.image,
         rank_templates_dir=args.rank_templates,
-        suit_templates_dir=args.suit_templates
+        suit_templates_dir=args.suit_templates,
+        debug=args.debug
     )
 
 

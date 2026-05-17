@@ -3,6 +3,11 @@ import pandas as pd
 from pathlib import Path
 from single_card_recognition import recognize_single_card
 
+
+"""
+Batch kiértékelést futtat az Excelben megadott képlistán,
+és összesíti a rank/suit pontosságot.
+"""
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--excel", required=True, type=Path, help="Az Excel fájl elérési útja")
@@ -15,10 +20,7 @@ def main():
         print(f"Nem található az Excel fájl: {args.excel}")
         return
 
-    # Excel beolvasása. Feltételezzük, hogy nincs fejléc, 
-    # vagy ha van is, a 0. oszlop a fájlnév, 1. a suit, 2. a rank.
     try:
-        # A header=0 azt feltételezi, hogy az első sor a fejléc. Ha nincs fejléc, akkor header=None.
         df = pd.read_excel(str(args.excel), header=None) 
     except Exception as e:
         print(f"Hiba az Excel fájl beolvasásakor: {e}")
@@ -32,19 +34,14 @@ def main():
     print("Képek feldolgozása...\n")
 
     for index, row in df.iterrows():
-        # Extraháljuk a cellák értékét szövegként
         filename = str(row.iloc[0]).strip()
         
-        # Ha a fájlnév nem tartalmazza a kiterjesztést, hozzáfűzzük a .jpg-t
         if not filename.lower().endswith('.jpg'):
             filename += '.jpg'
             
         expected_suit = str(row.iloc[1]).strip()
         expected_rank = str(row.iloc[2]).strip()
         
-        # Opcionálisan kihagyjuk a fejlécet, ha 'filename'-ként van írva
-        if filename.lower() in ['filename.jpg', 'fájlnév.jpg', 'fajlnev.jpg', 'kép.jpg', 'kep.jpg', 'nan.jpg']:
-            continue
             
         total += 1
         img_path = args.images_dir / filename
@@ -54,7 +51,6 @@ def main():
             continue
 
         try:
-            # Felismerés hívása debug mode nélkül (tehát nem dobál fel ablakokat)
             pred_rank, pred_suit = recognize_single_card(
                 image_path=img_path,
                 rank_templates_dir=args.rank_templates,
